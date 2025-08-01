@@ -1,78 +1,89 @@
-import RPi.GPIO as GPIO
+#!/usr/bin/env python3
+import lgpio
 import time
 import threading
-import sys
 import serial
+import signal
+import sys
+from datetime import datetime
 
-# Настройка GPIO
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(11, GPIO.IN)         # GPIO11 — вход PPS
-GPIO.setup(26, GPIO.OUT)        # GPIO26 — выход на реле
-GPIO.output(26, GPIO.LOW)
+# Настройки GPIO
+PULSE_GPIO = 26   # Выходной пин для 1 Гц
+PPS_GPIO = 11     # Вход PPS
+CHIP = 0          # GPIO-чип 0
 
-gpio26_state = False
-latest_gpgga = "ожидание..."
-lock = threading.Lock()
+# Настройки UART
+GPS_PORT = "/dev/ttyAMA4"
+GPS_BAUDRATE = 9600
 
-pulse_on = 0.5     # 0.5 сек HIGH
-pulse_off = 0.5    # 0.5 сек LOW (итого 1 Гц)
+# Состояние
+stop_event = threading.Event()
 
-def pulse_generator():
-    global gpio26_state
-    while True:
-        with lock:
-            gpio26_state = True
-        GPIO.output(26, GPIO.HIGH)
-        time.sleep(pulse_on)
+# Инициализация
+h = lgpio.gpiochip_open(CHIP)
+lgpio.set_mode(h, PULSE_GPIO, lgpio.OUTPUT)
+lgpio.set_mode(h, PPS_GPIO, lgpio.INPUT)
 
-        with lock:
-            gpio26_state = False
-        GPIO.output(26, GPIO.LOW)
-        time.sleep(pulse_off)
+def generate_pulse():
+    while not stop_event.is_set():
+        lgpio.gpio_write(h, PULSE_GPIO, 1)
+        time.sleep(0.1)
+        lgpio.gpio_write(h, PULSE_GPIO, 0)
+        time.sleep(0.9)
 
-def gps_reader():
-    global latest_gpgga
+def read_pps():
+    while not stop_event.is_set():
+        level = lgpio.gpio_read(h, PPS_GPIO)
+        global last_pps
+        last_pps = level
+        time.sleep(0.1)
+
+def read_gps():
     try:
-        with serial.Serial('/dev/ttyAMA4', 9600, timeout=1) as ser:
-            while True:
-                line = ser.readline().decode(errors='ignore').strip()
-                if line.startswith("$GPGGA"):
-                    with lock:
-                        latest_gpgga = line
-    except Exception as e:
-        with lock:
-            latest_gpgga = f"GPS ошибка: {e}"
+        ser = serial.Serial(GPS_PORT, GPS_BAUDRATE, timeout=1)
+    except serial.SerialException:
+        return None
+    while not stop_event.is_set():
+        line = ser.readline().decode(errors='ignore').strip()
+        if line.startswith("$GPGGA"):
+            global last_nmea
+            last_nmea = line
+        time.sleep(0.1)
+    ser.close()
 
-def print_table_header():
-    print("=" * 100)
-    print("{:<10} | {:<5} | {:<9} | {:<70}".format("Время", "PPS", "Реле ЛВМ", "Данные GPS"))
-    print("=" * 100)
+# Переменные состояния
+last_pps = 0
+last_nmea = ""
 
-def monitor_input():
-    print_table_header()
-    while True:
-        with lock:
-            output_state = int(gpio26_state)
-            gps_data = latest_gpgga
-        input_state = GPIO.input(11)
-        t = time.strftime("%H:%M:%S")
-        row = "{:<10} | {:<5} | {:<9} | {:<70}".format(t, input_state, output_state, gps_data)
-        sys.stdout.write("\r" + row[:100])  # обрезаем до ширины терминала
-        sys.stdout.flush()
-        time.sleep(0.2)
+# Запуск потоков
+pulse_thread = threading.Thread(target=generate_pulse)
+pps_thread = threading.Thread(target=read_pps)
+gps_thread = threading.Thread(target=read_gps)
 
+pulse_thread.start()
+pps_thread.start()
+gps_thread.start()
+
+print("=== LCM Test Script Started ===")
+print("GPIO26 — импульсы 1 Гц | GPIO11 — PPS вход | Данные GPS — /dev/ttyAMA4")
+print("Нажмите Ctrl+C для выхода.\n")
+print("=" * 100)
+print("Время      | PPS   | Реле ЛВМ  | Данные GPS")
+print("=" * 100)
+
+# Основной цикл
 try:
-    print("=== LCM Test Script Started ===")
-    print("GPIO26 — импульсы 1 Гц | GPIO11 — PPS вход | Данные GPS — /dev/ttyAMA4")
-    print("Нажмите Ctrl+C для выхода.\n")
-
-    threading.Thread(target=pulse_generator, daemon=True).start()
-    threading.Thread(target=gps_reader, daemon=True).start()
-    monitor_input()
-
+    while True:
+        now = datetime.now().strftime("%H:%M:%S")
+        gps_data = last_nmea.ljust(80)
+        print(f"{now}   | {last_pps}     | 1         | {gps_data}")
+        time.sleep(1)
 except KeyboardInterrupt:
     print("\nЗавершение по Ctrl+C")
-
-finally:
-    GPIO.cleanup()
+    stop_event.set()
+    pulse_thread.join()
+    pps_thread.join()
+    gps_thread.join()
+    lgpio.gpiochip_close(h)
     print("GPIO очищены, выход.")
+    sys.exit(0)
